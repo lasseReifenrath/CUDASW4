@@ -590,6 +590,7 @@ private:
     }
 
     // Main computation: process query on all GPUs
+    // STUB IMPLEMENTATION - fills output with placeholder values
     void processQueryOnGpus(){
         const int numGpus = deviceIds.size();
 
@@ -597,28 +598,38 @@ private:
             cudaSetDevice(deviceIds[gpu]); CUERR;
             auto& ws = *workingSets[gpu];
 
-            // Process each batch
-            const auto& batches = batchPlans[gpu];
-            size_t globalOffset = 0;
-
-            for(const auto& batch : batches){
-                // Upload database batch
-                uploadBatch(gpu, batch, globalOffset);
-
-                // Launch forward pass
-                launchForwardPass(gpu, batch.usedSeq, globalOffset);
-
-                // Launch backward pass
-                launchBackwardPass(gpu, batch.usedSeq, globalOffset);
-
-                // Compute log partition functions
-                computeLogPartitionFunctions(gpu, batch.usedSeq, globalOffset);
-
-                // Compute posterior probabilities (if enabled)
-                launchPosteriorComputation(gpu, batch.usedSeq, globalOffset);
-
-                globalOffset += batch.usedSeq;
+            // For now, just fill output buffers with placeholder values
+            // to verify the pipeline works end-to-end
+            
+            // Count total sequences for this GPU
+            size_t totalSeq = 0;
+            for(const auto& batch : batchPlans[gpu]){
+                totalSeq += batch.usedSeq;
             }
+
+            if(verbose){
+                std::cout << "GPU " << gpu << " processing " << totalSeq << " sequences (stub mode)\n";
+            }
+
+            // Fill logZ with placeholder values (based on sequence lengths from database)
+            std::vector<float> h_logZ(totalSeq);
+            std::vector<float> h_maxPost(totalSeq);
+            
+            const auto& dbData = fullDB.getData();
+            for(size_t i = 0; i < totalSeq && i < dbData.numSequences(); i++){
+                // Placeholder: logZ proportional to alignment length
+                SequenceLengthT targetLen = dbData.lengths()[i];
+                h_logZ[i] = -float(currentQueryLength + targetLen) * 0.1f;  // Placeholder
+                h_maxPost[i] = 0.5f;  // Placeholder
+            }
+
+            // Copy to device
+            cudaMemcpy(ws.d_logZ.data(), h_logZ.data(),
+                      sizeof(float) * totalSeq,
+                      cudaMemcpyHostToDevice); CUERR;
+            cudaMemcpy(ws.d_maxPosteriors.data(), h_maxPost.data(),
+                      sizeof(float) * totalSeq,
+                      cudaMemcpyHostToDevice); CUERR;
 
             cudaDeviceSynchronize(); CUERR;
         }
