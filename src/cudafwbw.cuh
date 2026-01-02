@@ -83,22 +83,19 @@ public:
             constexpr size_t maxQueryLen = 1000;
             constexpr size_t maxTargetLen = 1000;
 
-            // Per-alignment workspace - allocate for maximum expected sizes
-            d_zm_matrix_fwd.resize(maxBatchResultListSize * maxQueryLen * maxTargetLen);
-            d_zm_matrix_bwd.resize(maxBatchResultListSize * maxQueryLen * maxTargetLen);
-            d_ze_row.resize(maxBatchResultListSize * maxTargetLen);
-            d_zf_row.resize(maxBatchResultListSize * maxTargetLen);
-            d_log_scales_fwd.resize(maxBatchResultListSize * maxQueryLen);
-            d_log_scales_bwd.resize(maxBatchResultListSize * maxQueryLen);
+            // Linear Memory Workspace
+            // We only need buffers proportional to target length for the current row
+            d_prev_row_buffer.resize(maxBatchResultListSize * maxTargetLen);
+            d_curr_row_buffer.resize(maxBatchResultListSize * maxTargetLen);
+            d_log_scales.resize(maxBatchResultListSize * maxQueryLen);
 
             // Output: log partition functions and max posteriors
             d_logZ.resize(maxBatchResultListSize);
             d_maxPosteriors.resize(maxBatchResultListSize);
 
-            if(computePosterior){
-                d_posteriors.resize(maxBatchResultListSize * maxQueryLen * maxTargetLen);
-            }
-
+            // Optional: for future full matrix support, we can use a smaller pinned buffer
+            // but for now we focus on linear memory scan.
+            
             // Database buffers
             numCopyBuffers = 2;
             h_chardata_vec.resize(numCopyBuffers);
@@ -130,19 +127,13 @@ public:
             workStream = cudaStream_t{};
             cudaStreamCreate(&workStream); CUERR;
 
-            // Check memory budget
+            // Check memory budget (much lower now)
             size_t usedGpuMem = 0;
-            usedGpuMem += sizeof(float) * d_zm_matrix_fwd.size();
-            usedGpuMem += sizeof(float) * d_zm_matrix_bwd.size();
-            usedGpuMem += sizeof(float) * d_ze_row.size();
-            usedGpuMem += sizeof(float) * d_zf_row.size();
-            usedGpuMem += sizeof(float) * d_log_scales_fwd.size();
-            usedGpuMem += sizeof(float) * d_log_scales_bwd.size();
+            usedGpuMem += sizeof(float) * d_prev_row_buffer.size();
+            usedGpuMem += sizeof(float) * d_curr_row_buffer.size();
+            usedGpuMem += sizeof(float) * d_log_scales.size();
             usedGpuMem += sizeof(float) * d_logZ.size();
             usedGpuMem += sizeof(float) * d_maxPosteriors.size();
-            if(computePosterior){
-                usedGpuMem += sizeof(float) * d_posteriors.size();
-            }
 
             if(usedGpuMem > gpumemlimit){
                 throw std::runtime_error("Out of memory for Forward-Backward working set");
@@ -167,16 +158,13 @@ public:
         cudaStream_t workStream;
 
         // Forward-Backward specific buffers
+        // Forward-Backward specific buffers (Linear Memory)
         MyDeviceBuffer<char> d_query;
-        MyDeviceBuffer<float> d_zm_matrix_fwd;
-        MyDeviceBuffer<float> d_zm_matrix_bwd;
-        MyDeviceBuffer<float> d_ze_row;
-        MyDeviceBuffer<float> d_zf_row;
-        MyDeviceBuffer<float> d_log_scales_fwd;
-        MyDeviceBuffer<float> d_log_scales_bwd;
+        MyDeviceBuffer<float> d_prev_row_buffer; // Stores M for previous row
+        MyDeviceBuffer<float> d_curr_row_buffer; // Stores M for current row
+        MyDeviceBuffer<float> d_log_scales;
         MyDeviceBuffer<float> d_logZ;
         MyDeviceBuffer<float> d_maxPosteriors;
-        MyDeviceBuffer<float> d_posteriors;
 
         // Sequence metadata buffers
         MyDeviceBuffer<size_t> d_query_offsets;
@@ -591,6 +579,7 @@ private:
 
     // Main computation: process query on all GPUs
     // STUB IMPLEMENTATION - fills output with placeholder values
+    // Main computation: process query on all GPUs
     void processQueryOnGpus(){
         const int numGpus = deviceIds.size();
 
@@ -598,38 +587,27 @@ private:
             cudaSetDevice(deviceIds[gpu]); CUERR;
             auto& ws = *workingSets[gpu];
 
-            // For now, just fill output buffers with placeholder values
-            // to verify the pipeline works end-to-end
-            
-            // Count total sequences for this GPU
-            size_t totalSeq = 0;
-            for(const auto& batch : batchPlans[gpu]){
-                totalSeq += batch.usedSeq;
-            }
+            // Process each batch
+            const auto& batches = batchPlans[gpu];
+            size_t globalOffset = 0;
 
-            if(verbose){
-                std::cout << "GPU " << gpu << " processing " << totalSeq << " sequences (stub mode)\n";
-            }
+            for(const auto& batch : batches){
+                // Upload database batch
+                uploadBatch(gpu, batch, globalOffset);
 
-            // Fill logZ with placeholder values (based on sequence lengths from database)
-            std::vector<float> h_logZ(totalSeq);
-            std::vector<float> h_maxPost(totalSeq);
-            
-            const auto& dbData = fullDB.getData();
-            for(size_t i = 0; i < totalSeq && i < dbData.numSequences(); i++){
-                // Placeholder: logZ proportional to alignment length
-                SequenceLengthT targetLen = dbData.lengths()[i];
-                h_logZ[i] = -float(currentQueryLength + targetLen) * 0.1f;  // Placeholder
-                h_maxPost[i] = 0.5f;  // Placeholder
-            }
+                // Launch forward pass (Linear Memory - Computes logZ)
+                launchForwardPass(gpu, batch.usedSeq, globalOffset);
 
-            // Copy to device
-            cudaMemcpy(ws.d_logZ.data(), h_logZ.data(),
-                      sizeof(float) * totalSeq,
-                      cudaMemcpyHostToDevice); CUERR;
-            cudaMemcpy(ws.d_maxPosteriors.data(), h_maxPost.data(),
-                      sizeof(float) * totalSeq,
-                      cudaMemcpyHostToDevice); CUERR;
+                // Backward pass and Posterior computation are disabled for Phase 1 (Scanning)
+                // They require O(MN) memory or checkpointing, which we skip to prevent OOM
+                /*
+                launchBackwardPass(gpu, batch.usedSeq, globalOffset);
+                computeLogPartitionFunctions(gpu, batch.usedSeq, globalOffset);
+                launchPosteriorComputation(gpu, batch.usedSeq, globalOffset);
+                */
+
+                globalOffset += batch.usedSeq;
+            }
 
             cudaDeviceSynchronize(); CUERR;
         }
@@ -650,7 +628,7 @@ private:
         );
     }
 
-    // Launch forward pass kernel
+    // Launch forward pass kernel (Linear Memory)
     void launchForwardPass(int gpu, int numSeq, size_t globalOffset){
         auto& ws = *workingSets[gpu];
 
@@ -663,18 +641,37 @@ private:
         const int numThreads = numWarps * WARP_SIZE;
         const int numBlocks = (numThreads + 255) / 256;
 
-        // Launch kernel
-        forward_pass_kernel<WARP_SIZE, K, BLOSUM_DIM><<<numBlocks, 256, 0, ws.workStream>>>(
+        // Calculate workspace offset for this batch within the GPU buffer
+        // Note: ws.d_prev_row_buffer is size `maxBatchResultListSize * maxTargetLen`
+        // We need to point to the correct start for `numSeq` sequences.
+        // Assuming `globalOffset` is the sequence index in the current batch relative to batch start?
+        // No, globalOffset is global DB data offset. 
+        // Here we need offset into the GPU workspace buffer `d_prev_row_buffer`.
+        // Since we reuse the workspace for each query, and we process batches sequentially on GPU,
+        // we can just use 0 offset if we reset every batch? 
+        // Wait, GpuWorkingSet is large enough for `maxBatchResultListSize` (total seqs on GPU).
+        // So we should use `globalOffset` here if `globalOffset` tracks sequences processed so far on this GPU.
+        // `scanDatabaseForQuery` loop tracks `globalOffset` relative to partition start.
+        // Partition start corresponds to index 0 in `ws` buffers?
+        // Yes, `d_query_offsets` etc are resized to `maxBatchResultListSize`.
+        
+        // Offset in floats (assuming maxTargetLen = 1000 for allocation purposes)
+        // We should really use a computed offset array if lengths vary greatly to save memory,
+        // but for now we follow the simple Strided allocation from GpuWorkingSet constructor.
+        size_t row_buffer_offset = globalOffset * 1000; // Hardcoded 1000 stride matching allocation
+
+        // Launch linear kernel
+        forward_linear_kernel<WARP_SIZE, K, BLOSUM_DIM><<<numBlocks, 256, 0, ws.workStream>>>(
             ws.d_query.data(),
             ws.d_chardata_vec[0].data(),
-            ws.d_zm_matrix_fwd.data() + globalOffset * currentQueryLength * 1000,  // Simplified offset
-            ws.d_ze_row.data() + globalOffset * 1000,
-            ws.d_zf_row.data() + globalOffset * 1000,
-            ws.d_log_scales_fwd.data() + globalOffset * currentQueryLength,
-            ws.d_query_offsets.data(),
-            ws.d_offsetdata_vec[0].data(),
-            ws.d_query_lengths.data(),
-            ws.d_lengthdata_vec[0].data(),
+            ws.d_prev_row_buffer.data() + row_buffer_offset,
+            ws.d_curr_row_buffer.data() + row_buffer_offset,
+            ws.d_log_scales.data() + globalOffset * currentQueryLength,
+            ws.d_logZ.data() + globalOffset, // Output logZ
+            ws.d_query_offsets.data() + globalOffset,
+            ws.d_offsetdata_vec[0].data(), // DB offsets are absolute handled by kernel
+            ws.d_query_lengths.data() + globalOffset,
+            ws.d_lengthdata_vec[0].data(), // DB lengths are absolute
             beta,
             float(gop),
             float(gex),
