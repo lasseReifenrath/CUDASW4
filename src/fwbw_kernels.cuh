@@ -536,7 +536,7 @@ __global__ void posterior_kernel(
 
 // Kernel to compute log partition function from forward pass
 // logZ = log(ZM_fwd[last_row, last_col]) + sum(log_scales_fwd)
-__global__ void logZ_kernel(
+__inline__ __global__ void logZ_kernel(
     const float* zm_fwd,           // log(ZM_fwd) matrix
     const float* log_scales_fwd,
     float* logZ,                   // Output: log partition function per alignment
@@ -573,7 +573,7 @@ __global__ void logZ_kernel(
 
 
 // Kernel to find max posterior per alignment (alternative to posterior_kernel when posteriors already computed)
-__global__ void max_posterior_kernel(
+__inline__ __global__ void max_posterior_kernel(
     const float* posteriors,
     float* max_posteriors,
     const SequenceLengthT* query_lengths,
