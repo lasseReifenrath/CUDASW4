@@ -35,7 +35,7 @@ COMPILE = $(COMPILER) $(NVCC_FLAGS) $(DIALECT) $(OPTIMIZATION) $(WARNINGS) -c $<
 
 
 # link object files into executable
-$(ARTIFACT): $(BUILDDIR)/main.o $(BUILDDIR)/sequence_io.o $(BUILDDIR)/dbdata.o $(BUILDDIR)/options.o $(BUILDDIR)/blosum.o $(BUILDDIR)/half2_kernel_instantiations.o $(BUILDDIR)/float_kernel_instantiations.o $(BUILDDIR)/dpx_s32_kernel_instantiations.o $(BUILDDIR)/dpx_s16_kernel_instantiations.o
+$(ARTIFACT): $(BUILDDIR)/main.o $(BUILDDIR)/sequence_io.o $(BUILDDIR)/dbdata.o $(BUILDDIR)/options.o $(BUILDDIR)/blosum.o $(BUILDDIR)/half2_kernel_instantiations.o $(BUILDDIR)/float_kernel_instantiations.o $(BUILDDIR)/dpx_s32_kernel_instantiations.o $(BUILDDIR)/dpx_s16_kernel_instantiations.o $(BUILDDIR)/fwbw_kernel_instantiations.o
 	$(COMPILER) $^ -o $(ARTIFACT) $(LDFLAGS)
 
 $(MAKEDB): $(BUILDDIR)/makedb.o $(BUILDDIR)/sequence_io.o $(BUILDDIR)/dbdata.o
@@ -48,7 +48,7 @@ $(GRIDSEARCH): $(BUILDDIR)/gridsearch.o $(BUILDDIR)/sequence_io.o $(BUILDDIR)/db
 	$(COMPILER) $^ -o $(GRIDSEARCH) $(LDFLAGS)
 
 
-$(BUILDDIR)/main.o : src/main.cu src/sequence_io.h src/length_partitions.hpp src/dbdata.hpp src/cudasw4.cuh src/kernels.cuh src/convert.cuh src/float_kernels.cuh src/half2_kernels.cuh src/dpx_s16_kernels.cuh src/blosum.hpp src/types.hpp
+$(BUILDDIR)/main.o : src/main.cu src/sequence_io.h src/length_partitions.hpp src/dbdata.hpp src/cudasw4.cuh src/cudafwbw.cuh src/kernels.cuh src/fwbw_kernels.cuh src/convert.cuh src/float_kernels.cuh src/half2_kernels.cuh src/dpx_s16_kernels.cuh src/blosum.hpp src/types.hpp
 	$(COMPILE)
 
 $(BUILDDIR)/sequence_io.o : src/sequence_io.cpp src/sequence_io.h
@@ -73,6 +73,9 @@ $(BUILDDIR)/dpx_s16_kernel_instantiations.o: src/dpx_s16_kernel_instantiations.c
 	$(COMPILE)
 
 $(BUILDDIR)/dpx_s32_kernel_instantiations.o: src/dpx_s32_kernel_instantiations.cu src/dpx_s32_kernels.cuh src/kernels.cuh
+	$(COMPILE)
+
+$(BUILDDIR)/fwbw_kernel_instantiations.o: src/fwbw_kernel_instantiations.cu src/fwbw_kernels.cuh
 	$(COMPILE)
 
 $(BUILDDIR)/makedb.o : src/makedb.cpp src/dbdata.hpp src/sequence_io.h

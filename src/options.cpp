@@ -166,6 +166,14 @@ bool parseArgs(int argc, char** argv, ProgramOptions& options){
             gotDB = true;
         }else if(arg == "--dpx"){
             gotDPX = true;
+        }else if(arg == "--fwbw" || arg == "--probabilistic"){
+            options.alignmentMode = cudasw4::AlignmentMode::Probabilistic;
+        }else if(arg == "--beta"){
+            options.fwbwParams.beta = std::stof(argv[++i]);
+        }else if(arg == "--posterior"){
+            options.fwbwParams.computePosterior = true;
+        }else if(arg == "--no-posterior"){
+            options.fwbwParams.computePosterior = false;
         }else if(arg == "--tsv"){
             options.outputMode = ProgramOptions::OutputMode::TSV;
         }else if(arg == "--of"){
@@ -246,6 +254,10 @@ void printHelp(int /*argc*/, char** argv){
     
     std::cout << "   Misc\n";
     std::cout << "      --dpx : Use DPX instructions. Hardware support requires Hopper (sm_90) or newer. Older GPUs fall back to software emulation.\n";
+    std::cout << "      --fwbw, --probabilistic : Use Forward-Backward probabilistic alignment instead of Smith-Waterman.\n";
+    std::cout << "      --beta <value> : Temperature parameter for Forward-Backward (default: 1.0).\n";
+    std::cout << "      --posterior : Compute posterior probabilities (Forward-Backward mode only, enabled by default).\n";
+    std::cout << "      --no-posterior : Skip posterior computation (Forward-Backward mode only).\n";
     std::cout << "      --of : Result output file. Parent directory must exist. Default: console output (/dev/stdout)\n";
     std::cout << "      --tsv : Print results as tab-separated values instead of plain text. \n";
     std::cout << "      --verbose : More console output. Shows timings. \n";

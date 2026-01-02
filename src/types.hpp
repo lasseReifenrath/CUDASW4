@@ -26,6 +26,17 @@ enum class BlosumType{
     BLOSUM80_20,
 };
 
+enum class AlignmentMode{
+    Deterministic,    // Smith-Waterman (original)
+    Probabilistic     // Forward-Backward
+};
+
+struct ForwardBackwardParams{
+    float beta = 1.0f;              // Temperature parameter
+    bool computePosterior = true;   // Whether to compute posterior matrix
+    bool returnLogZ = true;         // Return log partition function
+};
+
 struct BLOSUM45_20{
     static constexpr std::int8_t low = -5;
     static constexpr int dim = 20 + 1;

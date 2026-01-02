@@ -15,6 +15,7 @@
 #include "options.hpp"
 #include "dbdata.hpp"
 #include "cudasw4.cuh"
+#include "cudafwbw.cuh"
 #include "config.hpp"
 
 
@@ -129,39 +130,152 @@ int main(int argc, char* argv[])
 
     helpers::PeerAccess peerAccess(deviceIds, false);
     peerAccess.enableAllPeerAccesses();
- 
-    using KernelTypeConfig = cudasw4::KernelTypeConfig;
-    using MemoryConfig = cudasw4::MemoryConfig;
-    using ScanResult = cudasw4::ScanResult;
-
-    KernelTypeConfig kernelTypeConfig;
-    kernelTypeConfig.singlePassType = options.singlePassType;
-    kernelTypeConfig.manyPassType_small = options.manyPassType_small;
-    kernelTypeConfig.manyPassType_large = options.manyPassType_large;
-    kernelTypeConfig.overflowType = options.overflowType;
-
-    MemoryConfig memoryConfig;
-    memoryConfig.maxBatchBytes = options.maxBatchBytes;
-    memoryConfig.maxBatchSequences = options.maxBatchSequences;
-    memoryConfig.maxTempBytes = options.maxTempBytes;
-    memoryConfig.maxGpuMem = options.maxGpuMem;
 
     std::ofstream outputfile(options.outputfile);
     if(!bool(outputfile)){
         throw std::runtime_error("Cannot open file " + options.outputfile);
     }
-    if(options.outputMode == ProgramOptions::OutputMode::TSV){
-        printTSVHeader(outputfile);
-    }
 
-    cudasw4::CudaSW4 cudaSW4(
-        deviceIds, 
-        options.numTopOutputs,
-        options.blosumType, 
-        kernelTypeConfig, 
-        memoryConfig, 
-        options.verbose
-    );
+    // Branch based on alignment mode
+    if(options.alignmentMode == cudasw4::AlignmentMode::Probabilistic){
+        // Forward-Backward probabilistic alignment mode
+        if(options.verbose){
+            std::cout << "Using Forward-Backward probabilistic alignment mode\n";
+        }
+
+        cudasw4::fwbw::MemoryConfig fwbwMemConfig;
+        fwbwMemConfig.maxBatchBytes = options.maxBatchBytes;
+        fwbwMemConfig.maxBatchSequences = options.maxBatchSequences;
+        fwbwMemConfig.maxGpuMem = options.maxGpuMem;
+
+        cudasw4::fwbw::CudaFwBw fwbwAligner(
+            deviceIds,
+            options.numTopOutputs,
+            options.blosumType,
+            fwbwMemConfig,
+            options.verbose
+        );
+
+        // Set parameters
+        fwbwAligner.setGapOpenScore(options.gop);
+        fwbwAligner.setGapExtendScore(options.gex);
+        fwbwAligner.setBeta(options.fwbwParams.beta);
+        fwbwAligner.setComputePosterior(options.fwbwParams.computePosterior);
+
+        // Load database
+        if(!options.usePseudoDB){
+            if(options.verbose){
+                std::cout << "Reading Database: \n";
+            }
+            try{
+                helpers::CpuTimer timer_read_db("Read DB");
+                constexpr bool writeAccess = false;
+                const bool prefetchSeq = options.prefetchDBFile;
+                auto fullDB_tmp = std::make_shared<cudasw4::DB>(cudasw4::loadDB(options.dbPrefix, writeAccess, prefetchSeq));
+                if(options.verbose){
+                    timer_read_db.print();
+                }
+                fwbwAligner.setDatabase(fullDB_tmp);
+            }catch(cudasw4::LoadDBException& ex){
+                if(options.verbose){
+                    std::cout << "Failed to map db files. Using fallback db. Error message: " << ex.what() << "\n";
+                }
+                helpers::CpuTimer timer_read_db("Read DB");
+                auto fullDB_tmp = std::make_shared<cudasw4::DBWithVectors>(cudasw4::loadDBWithVectors(options.dbPrefix));
+                if(options.verbose){
+                    timer_read_db.print();
+                }
+                fwbwAligner.setDatabase(fullDB_tmp);
+            }
+        }else{
+            throw std::runtime_error("Pseudo DB not supported for probabilistic mode");
+        }
+
+        // Print FwBw-specific TSV header
+        if(options.outputMode == ProgramOptions::OutputMode::TSV){
+            outputfile << "Query number\tQuery length\tQuery header\tResult number\tlogZ\tMax Posterior\tReference length\tReference header\tReference ID\n";
+        }
+
+        // Process queries
+        for(const auto& queryFile : options.queryFiles){
+            std::cout << "Processing query file " << queryFile << "\n";
+
+            kseqpp::KseqPP reader(queryFile);
+            int64_t query_num = 0;
+
+            while(reader.next() >= 0){
+                std::cout << "Processing query " << query_num << " ... ";
+                std::cout.flush();
+                const std::string& header = reader.getCurrentHeader();
+                const std::string& sequence = reader.getCurrentSequence();
+
+                auto fwbwResult = fwbwAligner.scan(sequence.data(), sequence.size());
+
+                std::cout << "Done.\n";
+
+                // Output results
+                if(options.numTopOutputs > 0){
+                    const int n = fwbwResult.logZ.size();
+                    for(int i = 0; i < n; i++){
+                        const auto referenceId = fwbwResult.referenceIds[i];
+
+                        if(options.outputMode == ProgramOptions::OutputMode::Plain){
+                            outputfile << "Result " << i << ".";
+                            outputfile << " logZ: " << fwbwResult.logZ[i] << ".";
+                            outputfile << " MaxPosterior: " << fwbwResult.maxPosteriors[i] << ".";
+                            outputfile << " Length: " << fwbwAligner.getReferenceLength(referenceId) << ".";
+                            outputfile << " Header " << fwbwAligner.getReferenceHeader(referenceId) << ".";
+                            outputfile << " referenceId " << referenceId;
+                            outputfile << "\n";
+                        }else{
+                            outputfile << query_num << "\t"
+                                      << sequence.size() << "\t"
+                                      << header << "\t"
+                                      << i << "\t"
+                                      << fwbwResult.logZ[i] << "\t"
+                                      << fwbwResult.maxPosteriors[i] << "\t"
+                                      << fwbwAligner.getReferenceLength(referenceId) << "\t"
+                                      << fwbwAligner.getReferenceHeader(referenceId) << "\t"
+                                      << referenceId << "\n";
+                        }
+                    }
+                    outputfile.flush();
+                }
+
+                query_num++;
+            }
+        }
+
+    } else {
+        // Standard deterministic Smith-Waterman mode
+        using KernelTypeConfig = cudasw4::KernelTypeConfig;
+        using MemoryConfig = cudasw4::MemoryConfig;
+        using ScanResult = cudasw4::ScanResult;
+
+        KernelTypeConfig kernelTypeConfig;
+        kernelTypeConfig.singlePassType = options.singlePassType;
+        kernelTypeConfig.manyPassType_small = options.manyPassType_small;
+        kernelTypeConfig.manyPassType_large = options.manyPassType_large;
+        kernelTypeConfig.overflowType = options.overflowType;
+
+        MemoryConfig memoryConfig;
+        memoryConfig.maxBatchBytes = options.maxBatchBytes;
+        memoryConfig.maxBatchSequences = options.maxBatchSequences;
+        memoryConfig.maxTempBytes = options.maxTempBytes;
+        memoryConfig.maxGpuMem = options.maxGpuMem;
+
+        if(options.outputMode == ProgramOptions::OutputMode::TSV){
+            printTSVHeader(outputfile);
+        }
+
+        cudasw4::CudaSW4 cudaSW4(
+            deviceIds, 
+            options.numTopOutputs,
+            options.blosumType, 
+            kernelTypeConfig, 
+            memoryConfig, 
+            options.verbose
+        );
 
     if(!options.usePseudoDB){
         if(options.verbose){
@@ -425,5 +539,7 @@ int main(int argc, char* argv[])
         }
 
     }
+
+    } // end of deterministic mode else block
 
 }

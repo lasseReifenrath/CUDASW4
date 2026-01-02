@@ -31,6 +31,10 @@ struct ProgramOptions{
     cudasw4::KernelType overflowType = cudasw4::KernelType::Float;
     OutputMode outputMode = OutputMode::Plain;
 
+    // Forward-Backward specific options
+    cudasw4::AlignmentMode alignmentMode = cudasw4::AlignmentMode::Deterministic;
+    cudasw4::ForwardBackwardParams fwbwParams;
+
     size_t maxBatchBytes = 128ull * 1024ull * 1024ull;
     size_t maxBatchSequences = 10'000'000;
     size_t maxTempBytes = 4ull * 1024ull * 1024ull * 1024ull;
