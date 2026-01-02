@@ -218,6 +218,11 @@ public:
         dbIsReady = false;
     }
 
+    void setDatabase(std::shared_ptr<DBWithVectors> dbPtr){
+        fullDB = dbPtr;
+        dbIsReady = false;
+    }
+
     void setBlosum(BlosumType blosumType_){ this->blosumType = blosumType_; }
     void setNumTop(int value){ results_per_query = value; }
     void setBeta(float value){ beta = value; }
@@ -225,11 +230,11 @@ public:
 
     // Database info methods
     size_t getReferenceLength(ReferenceIdT id) const{
-        return fullDB.getData().getSequenceLength(id);
+        return fullDB->getData().getSequenceLength(id);
     }
 
     std::string getReferenceHeader(ReferenceIdT id) const{
-        return fullDB.getData().getSequenceHeader(id);
+        return fullDB->getData().getSequenceHeader(id);
     }
 
     // Main scanning method
@@ -293,7 +298,7 @@ public:
             std::cout << "Forward-Backward: Initializing database...\n";
         }
 
-        const auto& dbData = fullDB.getData();
+        const auto& dbData = fullDB->getData();
         const size_t numDBSequences = dbData.numSequences();
         maxBatchResultListSize = numDBSequences;
 
@@ -343,7 +348,7 @@ private:
 
         fullDB_numSequencesPerLengthPartition.resize(numLengthPartitions);
 
-        const auto& dbData = fullDB.getData();
+        const auto& dbData = fullDB->getData();
         auto partitionBegin = dbData.lengths();
 
         for(int i = 0; i < numLengthPartitions; i++){
@@ -370,7 +375,7 @@ private:
         lengthPartitionIdsForGpus.clear();
         numSequencesPerGpu.clear();
 
-        const auto& data = fullDB.getData();
+        const auto& data = fullDB->getData();
 
         subPartitionsForGpus.resize(numGpus);
         lengthPartitionIdsForGpus.resize(numGpus);
@@ -413,6 +418,98 @@ private:
                 numSequencesPerGpu[i] += p.numSequences();
             }
         }
+    }
+
+    // Compute database copy plan for batching
+    std::vector<DeviceBatchCopyToPinnedPlan> computeDbCopyPlan(
+        const std::vector<DBdataView>& dbPartitions,
+        size_t MAX_CHARDATA_BYTES,
+        size_t MAX_SEQ
+    ) const {
+        std::vector<DeviceBatchCopyToPinnedPlan> result;
+    
+        size_t currentCopyPartition = 0;
+        size_t currentCopySeqInPartition = 0;
+    
+        while(currentCopyPartition < dbPartitions.size()){
+            
+            size_t usedBytes = 0;
+            size_t usedSeq = 0;
+    
+            DeviceBatchCopyToPinnedPlan plan;
+    
+            while(currentCopyPartition < dbPartitions.size()){
+                if(dbPartitions[currentCopyPartition].numSequences() == 0){
+                    currentCopyPartition++;
+                    continue;
+                }
+    
+                size_t remainingBytes = MAX_CHARDATA_BYTES - usedBytes;
+                
+                auto dboffsetsBegin = dbPartitions[currentCopyPartition].offsets() + currentCopySeqInPartition;
+                auto dboffsetsEnd = dbPartitions[currentCopyPartition].offsets() + dbPartitions[currentCopyPartition].numSequences() + 1;
+                
+                auto searchFor = dbPartitions[currentCopyPartition].offsets()[currentCopySeqInPartition] + remainingBytes + 1;
+                auto it = std::lower_bound(dboffsetsBegin, dboffsetsEnd, searchFor);
+    
+                size_t numToCopyByBytes = 0;
+                if(it != dboffsetsBegin){
+                    numToCopyByBytes = std::distance(dboffsetsBegin, it) - 1;
+                }
+                if(numToCopyByBytes == 0 && currentCopySeqInPartition == 0){
+                    break;
+                }
+                
+                size_t remainingSeq = MAX_SEQ - usedSeq;            
+                size_t numToCopyBySeq = std::min(dbPartitions[currentCopyPartition].numSequences() - currentCopySeqInPartition, remainingSeq);
+                size_t numToCopy = std::min(numToCopyByBytes, numToCopyBySeq);
+    
+                if(numToCopy > 0){
+                    DeviceBatchCopyToPinnedPlan::CopyRange copyRange;
+                    copyRange.lengthPartitionId = currentCopyPartition;
+                    copyRange.currentCopyPartition = currentCopyPartition;
+                    copyRange.currentCopySeqInPartition = currentCopySeqInPartition;
+                    copyRange.numToCopy = numToCopy;
+                    plan.copyRanges.push_back(copyRange);
+    
+                    if(usedSeq == 0){
+                        plan.h_partitionIds.push_back(currentCopyPartition);
+                        plan.h_numPerPartition.push_back(numToCopy);
+                    }else{
+                        if(plan.h_partitionIds.back() == int(currentCopyPartition)){
+                            plan.h_numPerPartition.back() += numToCopy;
+                        }else{
+                            plan.h_partitionIds.push_back(currentCopyPartition);
+                            plan.h_numPerPartition.push_back(numToCopy);
+                        }
+                    }
+                    usedBytes += (dbPartitions[currentCopyPartition].offsets()[currentCopySeqInPartition+numToCopy] 
+                        - dbPartitions[currentCopyPartition].offsets()[currentCopySeqInPartition]);
+                    usedSeq += numToCopy;
+    
+                    currentCopySeqInPartition += numToCopy;
+                    if(currentCopySeqInPartition == dbPartitions[currentCopyPartition].numSequences()){
+                        currentCopySeqInPartition = 0;
+                        currentCopyPartition++;
+                    }
+                }else{
+                    break;
+                }
+            }
+    
+            plan.usedBytes = usedBytes;
+            plan.usedSeq = usedSeq;    
+            
+            if(usedSeq == 0 && currentCopyPartition < dbPartitions.size() && dbPartitions[currentCopyPartition].numSequences() > 0){
+                break;
+            }
+    
+            if(plan.usedSeq > 0){
+                result.push_back(plan);
+            }
+        }
+    
+        return result;
     }
 
     // Create database batching plans
@@ -524,26 +621,18 @@ private:
     }
 
     // Upload a batch of database sequences
-    void uploadBatch(int gpu, const DeviceBatchCopyToPinnedPlan& batch, size_t globalOffset){
+    void uploadBatch(int gpu, const DeviceBatchCopyToPinnedPlan& batch, size_t /*globalOffset*/){
         auto& ws = *workingSets[gpu];
 
-        // Copy database sequences to device
-        const auto& view = subPartitionsForGpus[gpu][batch.partitionId];
-
-        cudaMemcpy(ws.d_chardata_vec[0].data(),
-                  view.chars() + batch.offsetsOffset,
-                  batch.usedBytes,
-                  cudaMemcpyHostToDevice); CUERR;
-
-        cudaMemcpy(ws.d_lengthdata_vec[0].data(),
-                  view.lengths() + batch.lengthsOffset,
-                  batch.usedSeq * sizeof(SequenceLengthT),
-                  cudaMemcpyHostToDevice); CUERR;
-
-        cudaMemcpy(ws.d_offsetdata_vec[0].data(),
-                  view.offsets() + batch.offsetsOffset,
-                  (batch.usedSeq + 1) * sizeof(size_t),
-                  cudaMemcpyHostToDevice); CUERR;
+        // Use the existing batch copy utility function
+        executeCopyPlanH2DDirect(
+            batch,
+            ws.d_chardata_vec[0].data(),
+            ws.d_lengthdata_vec[0].data(),
+            ws.d_offsetdata_vec[0].data(),
+            subPartitionsForGpus[gpu],
+            ws.workStream
+        );
     }
 
     // Launch forward pass kernel
@@ -676,7 +765,7 @@ private:
     std::vector<int> deviceIds;
     std::vector<std::unique_ptr<GpuWorkingSet>> workingSets;
     std::vector<cudaStream_t> gpuStreams;
-    std::vector<helpers::CudaEvent> gpuEvents;
+    std::vector<CudaEvent> gpuEvents;
 
     std::shared_ptr<DB> fullDB;
 
