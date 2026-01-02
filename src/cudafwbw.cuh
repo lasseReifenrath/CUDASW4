@@ -214,12 +214,12 @@ public:
     void setGapExtendScore(int score){ gex = score; }
 
     void setDatabase(std::shared_ptr<DB> dbPtr){
-        fullDB = dbPtr;
+        fullDB = AnyDBWrapper(dbPtr);
         dbIsReady = false;
     }
 
     void setDatabase(std::shared_ptr<DBWithVectors> dbPtr){
-        fullDB = dbPtr;
+        fullDB = AnyDBWrapper(dbPtr);
         dbIsReady = false;
     }
 
@@ -230,11 +230,15 @@ public:
 
     // Database info methods
     size_t getReferenceLength(ReferenceIdT id) const{
-        return fullDB->getData().getSequenceLength(id);
+        const auto& data = fullDB.getData();
+        return data.lengths()[id];
     }
 
     std::string getReferenceHeader(ReferenceIdT id) const{
-        return fullDB->getData().getSequenceHeader(id);
+        const auto& data = fullDB.getData();
+        const char* const headerBegin = data.headers() + data.headerOffsets()[id];
+        const char* const headerEnd = data.headers() + data.headerOffsets()[id+1];
+        return std::string(headerBegin, std::distance(headerBegin, headerEnd));
     }
 
     // Main scanning method
@@ -298,7 +302,7 @@ public:
             std::cout << "Forward-Backward: Initializing database...\n";
         }
 
-        const auto& dbData = fullDB->getData();
+        const auto& dbData = fullDB.getData();
         const size_t numDBSequences = dbData.numSequences();
         maxBatchResultListSize = numDBSequences;
 
@@ -348,7 +352,7 @@ private:
 
         fullDB_numSequencesPerLengthPartition.resize(numLengthPartitions);
 
-        const auto& dbData = fullDB->getData();
+        const auto& dbData = fullDB.getData();
         auto partitionBegin = dbData.lengths();
 
         for(int i = 0; i < numLengthPartitions; i++){
@@ -375,7 +379,7 @@ private:
         lengthPartitionIdsForGpus.clear();
         numSequencesPerGpu.clear();
 
-        const auto& data = fullDB->getData();
+        const auto& data = fullDB.getData();
 
         subPartitionsForGpus.resize(numGpus);
         lengthPartitionIdsForGpus.resize(numGpus);
@@ -767,7 +771,7 @@ private:
     std::vector<cudaStream_t> gpuStreams;
     std::vector<CudaEvent> gpuEvents;
 
-    std::shared_ptr<DB> fullDB;
+    AnyDBWrapper fullDB;
 
     // Database partitioning data
     std::vector<size_t> fullDB_numSequencesPerLengthPartition;
